@@ -129,6 +129,12 @@ function sendSetu(context, replyFunc, logger, bot) {
               setTimeout(() => {
                 bot('delete_msg', { message_id });
               }, delTime * 1000);
+            if (context.group_id)
+              bot('set_group_ban', {
+                group_id: context.group_id,
+                user_id: context.user_id,
+                duration: 60,
+              });
           })
           .catch(e => {
             console.error(`${global.getTime()} [error] delete msg\n${e}`);
