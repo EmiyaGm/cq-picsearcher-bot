@@ -1,8 +1,8 @@
 import Cheerio from 'cheerio';
 import { URL } from 'url';
-const { get } = require('./axiosProxy');
+const Axios = require('./axiosProxy');
 
-const domainList = ['danbooru.donmai.us', 'konachan.com', 'yande.re', 'gelbooru.com'];
+const domainList = new Set(['danbooru.donmai.us', 'konachan.com', 'yande.re', 'gelbooru.com']);
 
 /**
  * 得到图源
@@ -13,8 +13,8 @@ const domainList = ['danbooru.donmai.us', 'konachan.com', 'yande.re', 'gelbooru.
  */
 export default async function (url) {
   const { host } = new URL(url);
-  if (!domainList.includes(host)) return null;
-  const { data } = await get(url);
+  if (!domainList.has(host)) return null;
+  const { data } = await Axios.get(url);
   const $ = Cheerio.load(data);
   switch (host) {
     case 'danbooru.donmai.us':

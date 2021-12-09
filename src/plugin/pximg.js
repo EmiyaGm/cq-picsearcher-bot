@@ -1,13 +1,14 @@
+import _ from 'lodash';
 import Koa from 'koa';
-import Router from 'koa-router';
+import Router from '@koa/router';
 import { createHttpTerminator } from 'http-terminator';
 import event from '../event';
-const { get } = require('../axiosProxy');
+const Axios = require('../axiosProxy');
 
 const safeKey = Math.random().toString(36).slice(2);
 let usePximgAddr = '';
 let server = null;
-let serverPort = null;
+let lastServerConfig = null;
 
 const app = new Koa();
 const router = new Router();
@@ -17,14 +18,15 @@ router.get('/', ctx => {
     ctx.status = 403;
     return;
   }
-  return get(url, {
+  return Axios.get(url, {
     responseType: 'arraybuffer',
     headers: {
       Referer: 'https://www.pixiv.net',
     },
+    validateStatus: null,
   }).then(ret => {
     const buffer = Buffer.from(ret.data, 'binary');
-    ctx.status = 200;
+    ctx.status = ret.status;
     ctx.type = ret.headers['content-type'];
     ctx.length = Buffer.byteLength(buffer);
     ctx.body = buffer;
@@ -34,34 +36,43 @@ app.use(router.routes()).use(router.allowedMethods());
 
 async function startProxy() {
   const setting = global.config.bot.setu;
-  const port = setting.pximgServerPort || 60233;
-  if (server && serverPort === port) return;
+  const serverConfig = {
+    host: setting.pximgServerHost || '127.0.0.1',
+    port: setting.pximgServerPort || 0,
+  };
+  const hasPximgProxy = !!setting.pximgProxy.trim().length;
+  if (server && _.isEqual(serverConfig, lastServerConfig) && !hasPximgProxy) return;
   if (server) {
     await server.terminate();
     server = null;
-    serverPort = null;
+    lastServerConfig = null;
   }
-  const proxy = setting.pximgProxy.trim();
-  if (proxy !== '') return;
-  const addr = setting.usePximgAddr.split(':');
-  if (!addr[0]) addr[0] = '127.0.0.1';
-  if (addr.length === 1) addr.push(port);
-  usePximgAddr = addr.join(':');
+  if (hasPximgProxy) return;
   try {
+    /** @type {import('net').Server} */
+    const appServer = await new Promise(resolve => {
+      const as = app.listen(serverConfig, () => resolve(as));
+    });
     server = createHttpTerminator({
-      server: app.listen(port),
+      server: appServer,
       gracefulTerminationTimeout: 0,
     });
-    serverPort = port;
-  } catch (error) {
-    console.error(`端口 ${port} 已被占用，本地 pximg 反代启动失败`);
+    const serverAddr = appServer.address();
+    const addr = setting.usePximgAddr.split(':');
+    if (!addr[0]) addr[0] = serverAddr.address;
+    if (addr.length === 1) addr.push(serverAddr.port);
+    usePximgAddr = addr.join(':');
+    lastServerConfig = serverConfig;
+  } catch (e) {
+    console.error(`${global.getTime()} [error] pximg proxy server`);
+    console.error(e);
   }
 }
 
 startProxy();
 event.on('reload', startProxy);
 
-export function getProxyURL(url) {
+export function getLocalReverseProxyURL(url) {
   return `http://${usePximgAddr}/?key=${safeKey}&url=${url}`;
 }
 

@@ -6,8 +6,8 @@ import saucenao, { snDB } from './src/saucenao';
 import whatanime from './src/whatanime';
 import ascii2d from './src/ascii2d';
 import CQ from './src/CQcode';
-import PSCache from './src/cache';
-import Logger from './src/Logger';
+import psCache from './src/cache';
+import logger from './src/logger';
 import RandomSeed from 'random-seed';
 import sendSetu from './src/plugin/setu';
 import Akhr from './src/plugin/akhr';
@@ -15,14 +15,16 @@ import _ from 'lodash';
 import minimist from 'minimist';
 import { rmdHandler } from './src/plugin/reminder';
 import broadcast from './src/broadcast';
-import antiBiliMiniApp from './src/plugin/antiBiliMiniApp';
+import bilibiliHandler from './src/plugin/bilibili';
 import logError from './src/logError';
 import event from './src/event';
 import corpus from './src/plugin/corpus';
+import getGroupFile from './src/plugin/getGroupFile';
+import searchingMap from './src/searchingMap';
+import asyncMap from './src/utils/asyncMap';
 const ocr = require('./src/plugin/ocr');
 
 const bot = new CQWebSocket(global.config.cqws);
-const logger = new Logger();
 const rand = RandomSeed.create();
 
 // 全局变量
@@ -30,13 +32,9 @@ globalReg({
   bot,
   replyMsg,
   sendMsg2Admin,
-});
-
-// 初始化
-let psCache = global.config.bot.cache.enable ? new PSCache() : null;
-event.on('reload', () => {
-  if (global.config.bot.cache.enable && !psCache) psCache = new PSCache();
-  setBotEventListener();
+  parseArgs,
+  replySearchMsgs,
+  sendGroupForwardMsg,
 });
 
 // 好友请求
@@ -51,6 +49,7 @@ bot.on('request.friend', context => {
         if (ans !== a) approve = false;
       });
     } catch (e) {
+      console.error(`${global.getTime()} 加好友请求`);
       console.error(e);
       approve = false;
     }
@@ -105,6 +104,7 @@ function setBotEventListener() {
   }
 }
 setBotEventListener();
+event.on('reload', setBotEventListener);
 
 // 连接相关监听
 bot
@@ -138,9 +138,12 @@ setInterval(() => {
 }, 60 * 1000);
 
 // 通用处理
-function commonHandle(e, context) {
+async function commonHandle(e, context) {
+  // 忽略自己发给自己的消息
+  if (context.user_id === bot._qq) return true;
+
   // 黑名单检测
-  if (Logger.checkBan(context.user_id, context.group_id)) return true;
+  if (logger.checkBan(context.user_id, context.group_id)) return true;
 
   // 语言库
   if (corpus(context)) return true;
@@ -150,23 +153,17 @@ function commonHandle(e, context) {
   if (startChar === '/' || startChar === '<') return true;
 
   // 通用指令
-  const args = parseArgs(context.message);
-  if (args.help) {
-    replyMsg(context, 'https://github.com/Tsuk1ko/cq-picsearcher-bot/wiki/%E5%A6%82%E4%BD%95%E9%A3%9F%E7%94%A8');
+  if (context.message === '--help') {
+    replyMsg(context, 'https://git.io/JEMWC');
     return true;
   }
-  if (args.version) {
+  if (context.message === '--version') {
     replyMsg(context, version);
     return true;
   }
-  if (args.about) {
+  if (context.message === '--about') {
     replyMsg(context, 'https://github.com/Tsuk1ko/cq-picsearcher-bot');
     return true;
-  }
-
-  // setu
-  if (global.config.bot.setu.enable) {
-    if (sendSetu(context, replyMsg, logger, bot)) return true;
   }
 
   // reminder
@@ -174,8 +171,13 @@ function commonHandle(e, context) {
     if (rmdHandler(context)) return true;
   }
 
+  // setu
+  if (global.config.bot.setu.enable) {
+    if (sendSetu(context)) return true;
+  }
+
   //  反哔哩哔哩小程序
-  antiBiliMiniApp(context, replyMsg);
+  if (await bilibiliHandler(context)) return true;
 
   return false;
 }
@@ -223,22 +225,20 @@ function adminPrivateMsg(e, context) {
   // Ban
   const { 'ban-u': bu, 'ban-g': bg } = args;
   if (bu && typeof bu === 'number') {
-    Logger.ban('u', bu);
+    logger.ban('u', bu);
     replyMsg(context, `已封禁用户${bu}`);
   }
   if (bg && typeof bg === 'number') {
-    Logger.ban('g', bg);
+    logger.ban('g', bg);
     replyMsg(context, `已封禁群组${bg}`);
   }
 
   // 明日方舟
-  if (args['update-akhr'])
-    Akhr.updateData()
-      .then(() => replyMsg(context, '方舟公招数据已更新'))
-      .catch(e => {
-        logError(e);
-        replyMsg(context, '方舟公招数据更新失败，请查看错误日志');
-      });
+  if (args['update-akhr'] || args['akhr-update']) {
+    Akhr.updateData().then(success =>
+      replyMsg(context, success ? '方舟公招数据已更新' : '方舟公招数据更新失败，请查看错误日志')
+    );
+  }
 
   // 停止程序（使用 pm2 时相当于重启）
   if (args.shutdown) process.exit();
@@ -250,10 +250,31 @@ function adminPrivateMsg(e, context) {
 }
 
 // 私聊以及群组@的处理
-function privateAndAtMsg(e, context) {
-  if (commonHandle(e, context)) {
+async function privateAndAtMsg(e, context) {
+  if (await commonHandle(e, context)) {
     e.stopPropagation();
     return;
+  }
+
+  if (context.message_type === 'group') {
+    try {
+      const rMsgId = _.get(/^\[CQ:reply,id=(-?\d+).*\]/.exec(context.message), 1);
+      if (rMsgId) {
+        const { data } = await bot('get_msg', { message_id: Number(rMsgId) });
+        if (data) {
+          // 如果回复的是机器人的消息则忽略
+          if (data.sender.user_id === bot._qq) {
+            e.stopPropagation();
+            return;
+          }
+          const imgs = getImgs(data.message);
+          const rMsg = imgs
+            .map(({ file, url }) => `[CQ:image,file=${CQ.escape(file, true)},url=${CQ.escape(url, true)}]`)
+            .join('');
+          context = { ...context, message: context.message.replace(/^\[CQ:reply,id=-?\d+.*?\]/, rMsg) };
+        }
+      }
+    } catch (error) {}
   }
 
   if (hasImage(context.message)) {
@@ -261,6 +282,7 @@ function privateAndAtMsg(e, context) {
     e.stopPropagation();
     searchImg(context);
   } else if (context.message.search('--') !== -1) {
+    // 忽略
   } else if (context.message_type === 'private') {
     const dbKey = context.message === 'book' ? 'doujin' : context.message;
     const db = snDB[dbKey];
@@ -281,8 +303,9 @@ function debugPrivateAndAtMsg(e, context) {
     e.stopPropagation();
     return global.config.bot.replys.debug;
   }
-  console.log(`${global.getTime()} 收到私聊消息 qq=${context.user_id}`);
-  console.log(_.truncate(context.message, { length: 2048, omission: '（字数过多，后续内容不予显示）' }));
+  if (context.message_type === 'private') console.log(`${global.getTime()} 收到私聊消息 qq=${context.user_id}`);
+  else console.log(`${global.getTime()} 收到群组消息 group=${context.group_id} qq=${context.user_id}`);
+  console.log(debugMsgDeleteBase64Content(context.message));
   return privateAndAtMsg(e, context);
 }
 
@@ -292,13 +315,13 @@ function debugGroupMsg(e, context) {
     return;
   }
   console.log(`${global.getTime()} 收到群组消息 group=${context.group_id} qq=${context.user_id}`);
-  console.log(_.truncate(context.message, { length: 2048, omission: '（字数过多，后续内容不予显示）' }));
+  console.log(debugMsgDeleteBase64Content(context.message));
   return groupMsg(e, context);
 }
 
 // 群组消息处理
-function groupMsg(e, context) {
-  if (commonHandle(e, context)) {
+async function groupMsg(e, context) {
+  if ((await commonHandle(e, context)) || (await getGroupFile(context))) {
     e.stopPropagation();
     return;
   }
@@ -313,9 +336,9 @@ function groupMsg(e, context) {
       logger.smSwitch(group_id, user_id, true, () => {
         replyMsg(context, global.config.bot.replys.searchModeTimeout, true);
       })
-    )
+    ) {
       replyMsg(context, global.config.bot.replys.searchModeOn, true);
-    else replyMsg(context, global.config.bot.replys.searchModeAlreadyOn, true);
+    } else replyMsg(context, global.config.bot.replys.searchModeAlreadyOn, true);
   } else if (new RegExp(global.config.bot.regs.searchModeOff).exec(context.message)) {
     e.stopPropagation();
     // 退出搜图
@@ -343,11 +366,12 @@ function groupMsg(e, context) {
 
     // 有图片则搜图
     if (hasImage(context.message)) {
+      e.stopPropagation();
       // 刷新搜图TimeOut
       logger.smSwitch(group_id, user_id, true, () => {
         replyMsg(context, global.config.bot.replys.searchModeTimeout, true);
       });
-      e.stopPropagation();
+      logger.smCount(group_id, user_id);
       searchImg(context, smStatus);
     }
   } else if (global.config.bot.repeat.enable) {
@@ -374,7 +398,7 @@ function groupMsg(e, context) {
 /**
  * 搜图
  *
- * @param {object} context
+ * @param {*} context
  * @param {number} [customDB=-1]
  * @returns
  */
@@ -397,7 +421,8 @@ async function searchImg(context, customDB = -1) {
   // 决定搜索库
   let db = snDB[global.config.bot.saucenaoDefaultDB] || snDB.all;
   if (customDB < 0) {
-    if (args.pixiv) db = snDB.pixiv;
+    if (args.all) db = snDB.all;
+    else if (args.pixiv) db = snDB.pixiv;
     else if (args.danbooru) db = snDB.danbooru;
     else if (args.doujin || args.book) db = snDB.doujin;
     else if (args.anime) db = snDB.anime;
@@ -416,85 +441,104 @@ async function searchImg(context, customDB = -1) {
   const msg = context.message;
   const imgs = getImgs(msg);
   for (const img of imgs) {
-    if (args['get-url']) replyMsg(context, img.url.replace(/\/([0-9]+)\/\/\1/, '///').replace(/\?.*$/, ''));
-    else {
-      // 获取缓存
-      let hasCache = false;
-      if (global.config.bot.cache.enable && !args.purge) {
-        const cache = await psCache.getCache(img.file, db);
+    // 指令：获取图片链接
+    if (args['get-url']) {
+      replyMsg(context, img.url);
+      continue;
+    }
 
-        // 如果有缓存
-        if (cache) {
-          hasCache = true;
-          for (const cmsg of cache) {
-            replySearchMsgs(context, `${CQ.escape('[缓存]')} ${cmsg}`);
-          }
-        }
+    // 获取缓存
+    if (psCache.enable && !args.purge) {
+      const cache = psCache.get(img, db);
+      if (cache) {
+        const msgs = cache.map(msg => `${CQ.escape('[缓存]')} ${msg}`);
+        if (msgs.length > 1 && global.config.bot.groupForwardSearchResult && context.message_type === 'group') {
+          await sendGroupForwardMsg(context.group_id, msgs);
+        } else await asyncMap(cache, msg => replySearchMsgs(context, `${CQ.escape('[缓存]')} ${msg}`));
+        continue;
       }
+    }
 
-      if (!hasCache) {
-        // 检查搜图次数
-        if (
-          context.user_id !== global.config.bot.admin &&
-          !logger.canSearch(context.user_id, global.config.bot.searchLimit)
-        ) {
-          replyMsg(context, global.config.bot.replys.personLimit, false, true);
-          return;
-        }
+    // 检查搜图次数
+    if (
+      context.user_id !== global.config.bot.admin &&
+      !logger.applyQuota(context.user_id, { value: global.config.bot.searchLimit })
+    ) {
+      replyMsg(context, global.config.bot.replys.personLimit, false, true);
+      return;
+    }
 
-        const needCacheMsgs = [];
-        let success = true;
-        let snLowAcc = false;
-        let useAscii2d = args.a2d;
-        let useWhatAnime = args.anime;
+    // 可能有其他人在搜同一张图
+    switch (searchingMap.put(img, db, context)) {
+      case searchingMap.IS_SEARCHING:
+        if (imgs.length === 1) replyMsg(context, global.config.bot.replys.searching, false, true);
+        continue;
+      case searchingMap.NOT_FIRST:
+        continue;
+    }
 
-        // saucenao
-        if (!useAscii2d) {
-          const snRes = await saucenao(img.url, db, args.debug || global.config.bot.debug);
-          if (!snRes.success) success = false;
-          if (snRes.lowAcc) snLowAcc = true;
-          if (
-            (global.config.bot.useAscii2dWhenLowAcc && snRes.lowAcc && (db === snDB.all || db === snDB.pixiv)) ||
-            (global.config.bot.useAscii2dWhenQuotaExcess && snRes.excess)
-          )
-            useAscii2d = true;
-          if (!snRes.lowAcc && snRes.msg.indexOf('anidb.net') !== -1) useWhatAnime = true;
-          if (snRes.msg.length > 0) needCacheMsgs.push(snRes.msg);
-          replySearchMsgs(context, snRes.msg, snRes.warnMsg);
-        }
+    const Replier = searchingMap.getReplier(img, db);
+    const needCacheMsgs = [];
+    let success = true;
+    let hasSucc = false;
+    let snLowAcc = false;
+    let useAscii2d = args.a2d;
+    let useWhatAnime = db === snDB.anime;
 
-        // ascii2d
-        if (useAscii2d) {
-          const { color, bovw, asErr } = await ascii2d(img.url, snLowAcc).catch(asErr => ({
-            asErr,
-          }));
-          if (asErr) {
-            const errMsg = (asErr.response && asErr.response.data.length < 50 && `\n${asErr.response.data}`) || '';
-            replySearchMsgs(context, `ascii2d 搜索失败${errMsg}`);
-            console.error(`${global.getTime()} [error] ascii2d`);
-            logError(asErr);
-          } else {
-            replySearchMsgs(context, color, bovw);
-            needCacheMsgs.push(color);
-            needCacheMsgs.push(bovw);
-          }
-        }
-
-        // 搜番
-        if (useWhatAnime) {
-          const waRet = await whatanime(img.url, args.debug || global.config.bot.debug);
-          if (!waRet.success) success = false; // 如果搜番有误也视作不成功
-          replyMsg(context, waRet.msg, false, true);
-          if (waRet.msg.length > 0) needCacheMsgs.push(waRet.msg);
-        }
-
-        if (success) logger.doneSearch(context.user_id);
-
-        // 将需要缓存的信息写入数据库
-        if (global.config.bot.cache.enable && success) {
-          await psCache.addCache(img.file, db, needCacheMsgs);
-        }
+    // saucenao
+    if (!useAscii2d) {
+      const snRes = await saucenao(img.url, db, args.debug || global.config.bot.debug);
+      if (!snRes.success) success = false;
+      if (snRes.success) hasSucc = true;
+      if (snRes.lowAcc) snLowAcc = true;
+      if (
+        !useWhatAnime &&
+        ((global.config.bot.useAscii2dWhenLowAcc && snRes.lowAcc && (db === snDB.all || db === snDB.pixiv)) ||
+          (global.config.bot.useAscii2dWhenQuotaExcess && snRes.excess) ||
+          (global.config.bot.useAscii2dWhenFailed && !success))
+      ) {
+        useAscii2d = true;
       }
+      if (!snRes.lowAcc && snRes.msg.indexOf('anidb.net') !== -1) useWhatAnime = true;
+      if (snRes.msg.length > 0) needCacheMsgs.push(snRes.msg);
+      await Replier.reply(snRes.msg, snRes.warnMsg);
+    }
+
+    // ascii2d
+    if (useAscii2d) {
+      const { color, bovw, success: asSuc, asErr } = await ascii2d(img.url, snLowAcc).catch(asErr => ({ asErr }));
+      if (asErr) {
+        success = false;
+        const errMsg =
+          (asErr.response && asErr.response.data.length < 100 && `\n${asErr.response.data}`) ||
+          (asErr.message && `\n${asErr.message}`) ||
+          '';
+        await Replier.reply(`ascii2d 搜索失败${errMsg}`);
+        console.error(`${global.getTime()} [error] ascii2d`);
+        logError(asErr);
+      } else {
+        if (asSuc) hasSucc = true;
+        if (!asSuc) success = false;
+        await Replier.reply(color, bovw);
+        needCacheMsgs.push(color, bovw);
+      }
+    }
+
+    // 搜番
+    if (useWhatAnime) {
+      const waRet = await whatanime(img.url, args.debug || global.config.bot.debug);
+      if (waRet.success) hasSucc = true;
+      if (!waRet.success) success = false; // 如果搜番有误也视作不成功
+      await Replier.reply(...waRet.msgs);
+      if (waRet.msgs.length > 0) needCacheMsgs.push(...waRet.msgs);
+    }
+
+    if (!hasSucc) logger.releaseQuota(context.user_id);
+    Replier.end();
+
+    // 将需要缓存的信息写入数据库
+    if (psCache.enable && success) {
+      psCache.set(img, db, needCacheMsgs);
     }
   }
 }
@@ -506,15 +550,15 @@ function doOCR(context) {
   const langSearch = /(?<=--lang=)[a-zA-Z]{2,3}/.exec(msg);
   if (langSearch) lang = langSearch[0];
 
-  const handleOcrResult = ret =>
-    replyMsg(context, ret.join('\n')).catch(e => {
-      replyMsg(context, 'OCR识别发生错误');
-      console.error(`${global.getTime()} [error] OCR`);
-      console.error(e);
-    });
-
   for (const img of imgs) {
-    ocr.default(img.url, lang).then(handleOcrResult);
+    ocr
+      .default(img, lang)
+      .then(results => replyMsg(context, results.join('\n')))
+      .catch(e => {
+        replyMsg(context, 'OCR发生错误');
+        console.error(`${global.getTime()} [error] OCR`);
+        console.error(e);
+      });
   }
 }
 
@@ -529,8 +573,6 @@ function doAkhr(context) {
     const imgs = getImgs(msg);
 
     const handleWords = words => {
-      //  fix some ...
-      if (global.config.bot.akhr.ocr === 'ocr.space') words = _.map(words, w => w.replace(/冫口了/g, '治疗'));
       replyMsg(context, CQ.img64(Akhr.getResultImg(words)));
     };
 
@@ -541,7 +583,7 @@ function doAkhr(context) {
     };
 
     for (const img of imgs) {
-      ocr[global.config.bot.akhr.ocr](img.url, 'chs').then(handleWords).catch(handleError);
+      ocr[global.config.bot.akhr.ocr](img, 'chs').then(handleWords).catch(handleError);
     }
   } else {
     replyMsg(context, '该功能未开启');
@@ -555,17 +597,12 @@ function doAkhr(context) {
  * @returns 图片URL数组
  */
 function getImgs(msg) {
-  const reg = /\[CQ:image,file=([^,]+),url=([^\]]+)\]/g;
-  const result = [];
-  let search = reg.exec(msg);
-  while (search) {
-    result.push({
-      file: search[1],
-      url: search[2],
-    });
-    search = reg.exec(msg);
-  }
-  return result;
+  const cqimgs = CQ.from(msg).filter(cq => cq.type === 'image');
+  return cqimgs.map(cq => {
+    const data = cq.pickData(['file', 'url']);
+    data.url = getUniversalImgURL(data.url);
+    return data;
+  });
 }
 
 /**
@@ -584,9 +621,10 @@ function hasImage(msg) {
  * @param {string} message 消息
  */
 function sendMsg2Admin(message) {
-  if (bot.isReady() && global.config.bot.admin > 0) {
+  const admin = global.config.bot.admin;
+  if (bot.isReady() && admin > 0 && admin !== bot._qq) {
     bot('send_private_msg', {
-      user_id: global.config.bot.admin,
+      user_id: admin,
       message,
     });
   }
@@ -595,17 +633,17 @@ function sendMsg2Admin(message) {
 /**
  * 回复消息
  *
- * @param {object} context 消息对象
+ * @param {*} context 消息对象
  * @param {string} message 回复内容
  * @param {boolean} at 是否at发送者
+ * @param {boolean} reply 是否使用回复形式
  */
-function replyMsg(context, message, at = false, reply = false) {
+async function replyMsg(context, message, at = false, reply = false) {
   if (!bot.isReady() || typeof message !== 'string' || message.length === 0) return;
   if (context.message_type !== 'private') {
     message = `${reply ? CQ.reply(context.message_id) : ''}${at ? CQ.at(context.user_id) : ''}${message}`;
   }
-  const logMsg =
-    global.config.bot.debug && _.truncate(message, { length: 2048, omission: '（字数过多，后续内容不予显示）' });
+  const logMsg = global.config.bot.debug && debugMsgDeleteBase64Content(message);
   switch (context.message_type) {
     case 'private':
       if (global.config.bot.debug) {
@@ -640,13 +678,12 @@ function replyMsg(context, message, at = false, reply = false) {
 /**
  * 回复搜图消息
  *
- * @param {object} context 消息对象
- * @param {Array<string>} msgs 回复内容
+ * @param {*} context 消息对象
+ * @param {string[]} msgs 回复内容
  */
 function replySearchMsgs(context, ...msgs) {
   msgs = msgs.filter(msg => msg && typeof msg === 'string');
   if (msgs.length === 0) return;
-  let promises = [];
   //  是否私聊回复
   if (global.config.bot.pmSearchResult) {
     switch (context.message_type) {
@@ -658,16 +695,35 @@ function replySearchMsgs(context, ...msgs) {
         }
         break;
     }
-    promises = msgs.map(msg =>
+    return asyncMap(msgs, msg =>
       bot('send_private_msg', {
         user_id: context.user_id,
+        group_id: global.config.bot.pmSearchResultTemp ? context.group_id : undefined,
         message: msg,
       })
     );
-  } else {
-    promises = msgs.map(msg => replyMsg(context, msg, false, true));
   }
-  return Promise.all(promises);
+  return asyncMap(msgs, msg => replyMsg(context, msg, false, true));
+}
+
+/**
+ * 发送合并转发
+ *
+ * @param {number} group_id 群号
+ * @param {string[]} msgs 消息
+ */
+function sendGroupForwardMsg(group_id, msgs) {
+  return bot('send_group_forward_msg', {
+    group_id,
+    messages: msgs.map(content => ({
+      type: 'node',
+      data: {
+        name: '\u200b',
+        uin: String(global.bot._qq),
+        content,
+      },
+    })),
+  });
 }
 
 /**
@@ -697,4 +753,15 @@ function parseArgs(str, enableArray = false, _key = null) {
   }
   if (_key && typeof m[_key] === 'string' && m._.length > 0) m[_key] += ' ' + m._.join(' ');
   return m;
+}
+
+function debugMsgDeleteBase64Content(msg) {
+  return msg.replace(/base64:\/\/[a-z\d+/=]+/gi, '(base64)');
+}
+
+function getUniversalImgURL(url = '') {
+  return url
+    .replace('/gchat.qpic.cn/gchatpic_new/', '/c2cpicdw.qpic.cn/offpic_new/')
+    .replace(/\/\d+\/+\d+-\d+-/, '/0/0-10000-')
+    .replace(/\?.*$/, '');
 }
