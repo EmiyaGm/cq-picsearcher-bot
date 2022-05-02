@@ -1,4 +1,3 @@
-import Path from 'path';
 import emitter from '../../emitter';
 
 /**
@@ -7,9 +6,7 @@ import emitter from '../../emitter';
 let Canvas = null;
 const loadCanvasModule = () => {
   if (global.config.bot.akhr.enable && !Canvas) {
-    Canvas = require('@napi-rs/canvas');
-    Canvas.GlobalFonts.registerFromPath(Path.resolve(__dirname, 'fonts/sarasa-gothic-sc-bold.ttf'), 'SarasaSC');
-    Canvas.GlobalFonts.registerFromPath(Path.resolve(__dirname, 'fonts/seguiemj.ttf'), 'SegoeUIEmoji');
+    Canvas = require('../../../libs/canvas');
   }
 };
 emitter.onConfigLoad(loadCanvasModule);
@@ -109,7 +106,10 @@ function getImg(AKDATA, results, recTags) {
 
   if (recTags.length < 5) {
     newLine();
-    drawCard('注意：词条识别出现遗漏，请将词条部分裁剪出来再试', false, colorPlan.white);
+    drawCard('注意：词条识别出现遗漏。如果含有“资深干员”或“高级资深干员”，', false, colorPlan.white);
+    x = axPadding;
+    y += fontSize + ratio * 4;
+    drawCard('请选中它们再截图；如果没有这俩词条请将词条部分裁剪出来再试。', false, colorPlan.white);
   }
 
   for (const { comb, chars } of results) {
